@@ -1,0 +1,772 @@
+import os
+import datetime
+from typing import List, Optional, Dict, Any
+
+from fastapi import FastAPI, Depends, HTTPException, status, APIRouter, Body, Query as FQuery, UploadFile, File, Form
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from pydantic import BaseModel, Field, EmailStr
+from sqlalchemy import create_engine, Column, Integer, String, TIMESTAMP, ForeignKey, Boolean, DECIMAL, TEXT, UniqueConstraint
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session, relationship
+from passlib.context import CryptContext
+
+# --- Configuration ---
+SECRET_KEY = os.getenv("SECRET_KEY", "a_very_secret_key_for_jwt_tokens")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+DATABASE_URL = "sqlite:///./agriadvisory.db"
+
+# --- Database Setup ---
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --- Security ---
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/admin/auth/login") # for system users
+oauth2_scheme_farmer = OAuth2PasswordBearer(tokenUrl="/auth/verify") # for farmers
+
+# --- SQLAlchemy Models (models.py) ---
+class Farmer(Base):
+    __tablename__ = 'Farmer'
+    farmer_id = Column(Integer, primary_key=True, index=True)
+    mobile_number = Column(String(15), unique=True, nullable=False, index=True)
+    name = Column(String(255), nullable=True)
+    location = Column(String(255), nullable=True)
+    preferred_language = Column(String(50), nullable=True)
+    created_at = Column(TIMESTAMP, default=datetime.datetime.utcnow)
+
+    crops = relationship("FarmerCrop", back_populates="farmer")
+    queries = relationship("Query", back_populates="farmer")
+    feedbacks = relationship("Feedback", back_populates="farmer")
+    saved_advisories = relationship("SavedAdvisory", back_populates="farmer")
+
+class SystemUser(Base):
+    __tablename__ = 'SystemUser'
+    user_id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(255), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(50), nullable=False)  # e.g., 'Admin', 'Expert'
+    created_at = Column(TIMESTAMP, default=datetime.datetime.utcnow)
+
+    authored_articles = relationship("KnowledgeBaseArticle", foreign_keys='KnowledgeBaseArticle.author_id', back_populates="author")
+    validated_articles = relationship("KnowledgeBaseArticle", foreign_keys='KnowledgeBaseArticle.validator_id', back_populates="validator")
+    created_alerts = relationship("Alert", back_populates="creator")
+
+class Crop(Base):
+    __tablename__ = 'Crop'
+    crop_id = Column(Integer, primary_key=True, index=True)
+    crop_name = Column(String(100), unique=True, nullable=False)
+
+class FarmerCrop(Base):
+    __tablename__ = 'FarmerCrop'
+    farmer_crop_id = Column(Integer, primary_key=True, index=True)
+    farmer_id = Column(Integer, ForeignKey('Farmer.farmer_id'), nullable=False)
+    crop_id = Column(Integer, ForeignKey('Crop.crop_id'), nullable=False)
+    __table_args__ = (UniqueConstraint('farmer_id', 'crop_id'),)
+
+    farmer = relationship("Farmer", back_populates="crops")
+    crop = relationship("Crop")
+
+class Query(Base):
+    __tablename__ = 'Query'
+    query_id = Column(Integer, primary_key=True, index=True)
+    farmer_id = Column(Integer, ForeignKey('Farmer.farmer_id'), nullable=False)
+    query_type = Column(String(20), nullable=False) # 'text', 'image', 'voice'
+    query_text = Column(TEXT, nullable=True)
+    query_image_url = Column(String(255), nullable=True)
+    status = Column(String(50), nullable=False, default='submitted')
+    submitted_at = Column(TIMESTAMP, default=datetime.datetime.utcnow)
+    is_offline_submission = Column(Boolean, default=False, nullable=False)
+
+    farmer = relationship("Farmer", back_populates="queries")
+    advisory = relationship("Advisory", back_populates="query", uselist=False)
+
+class KnowledgeBaseArticle(Base):
+    __tablename__ = 'KnowledgeBaseArticle'
+    article_id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    content = Column(TEXT, nullable=False)
+    status = Column(String(50), nullable=False, default='draft') # 'draft', 'pending_review', 'published', 'rejected'
+    author_id = Column(Integer, ForeignKey('SystemUser.user_id'))
+    validator_id = Column(Integer, ForeignKey('SystemUser.user_id'), nullable=True)
+    created_at = Column(TIMESTAMP, default=datetime.datetime.utcnow)
+    updated_at = Column(TIMESTAMP, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+    author = relationship("SystemUser", foreign_keys=[author_id], back_populates="authored_articles")
+    validator = relationship("SystemUser", foreign_keys=[validator_id], back_populates="validated_articles")
+
+class Advisory(Base):
+    __tablename__ = 'Advisory'
+    advisory_id = Column(Integer, primary_key=True, index=True)
+    query_id = Column(Integer, ForeignKey('Query.query_id'), unique=True, nullable=False)
+    source_article_id = Column(Integer, ForeignKey('KnowledgeBaseArticle.article_id'), nullable=True)
+    advisory_text = Column(TEXT, nullable=False)
+    confidence_score = Column(DECIMAL(5, 2), nullable=True)
+    generated_at = Column(TIMESTAMP, default=datetime.datetime.utcnow)
+
+    query = relationship("Query", back_populates="advisory")
+    source_article = relationship("KnowledgeBaseArticle")
+    feedback = relationship("Feedback", back_populates="advisory")
+
+class Feedback(Base):
+    __tablename__ = 'Feedback'
+    feedback_id = Column(Integer, primary_key=True, index=True)
+    advisory_id = Column(Integer, ForeignKey('Advisory.advisory_id'), nullable=False)
+    farmer_id = Column(Integer, ForeignKey('Farmer.farmer_id'), nullable=False)
+    is_helpful = Column(Boolean, nullable=False)
+    feedback_at = Column(TIMESTAMP, default=datetime.datetime.utcnow)
+
+    advisory = relationship("Advisory", back_populates="feedback")
+    farmer = relationship("Farmer", back_populates="feedbacks")
+
+class SavedAdvisory(Base):
+    __tablename__ = 'SavedAdvisory'
+    saved_advisory_id = Column(Integer, primary_key=True, index=True)
+    farmer_id = Column(Integer, ForeignKey('Farmer.farmer_id'), nullable=False)
+    advisory_id = Column(Integer, ForeignKey('Advisory.advisory_id'), nullable=False)
+    saved_at = Column(TIMESTAMP, default=datetime.datetime.utcnow)
+    __table_args__ = (UniqueConstraint('farmer_id', 'advisory_id'),)
+
+    farmer = relationship("Farmer", back_populates="saved_advisories")
+    advisory = relationship("Advisory")
+
+class Alert(Base):
+    __tablename__ = 'Alert'
+    alert_id = Column(Integer, primary_key=True, index=True)
+    creator_id = Column(Integer, ForeignKey('SystemUser.user_id'), nullable=False)
+    title = Column(String(255), nullable=False)
+    message = Column(TEXT, nullable=False)
+    sent_at = Column(TIMESTAMP, default=datetime.datetime.utcnow)
+
+    creator = relationship("SystemUser", back_populates="created_alerts")
+
+# --- Pydantic Schemas (schemas.py) ---
+
+# Token
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    sub: str # subject (e.g., username or mobile_number)
+    role: Optional[str] = None
+
+# Farmer
+class FarmerBase(BaseModel):
+    mobile_number: str
+
+class FarmerCreate(FarmerBase):
+    pass
+
+class FarmerProfileUpdate(BaseModel):
+    name: str
+    location: str
+    preferred_language: str
+
+class FarmerProfile(FarmerProfileUpdate):
+    farmer_id: int
+    mobile_number: str
+
+    class Config:
+        orm_mode = True
+
+# Crop
+class CropBase(BaseModel):
+    crop_name: str
+
+class Crop(CropBase):
+    crop_id: int
+
+    class Config:
+        orm_mode = True
+
+class FarmerCropResponse(BaseModel):
+    farmer_crop_id: int
+    farmer_id: int
+    crop_id: int
+
+    class Config:
+        orm_mode = True
+
+# Query
+class QueryCreate(BaseModel):
+    query_type: str
+    query_text: Optional[str] = None
+
+class QueryResponse(BaseModel):
+    query_id: int
+    status: str
+    submitted_at: datetime.datetime
+
+    class Config:
+        orm_mode = True
+
+class QuerySummary(BaseModel):
+    query_id: int
+    query_type: str
+    query_text: Optional[str]
+    status: str
+    submitted_at: datetime.datetime
+
+    class Config:
+        orm_mode = True
+
+class OfflineQuery(BaseModel):
+    query_type: str
+    query_text: Optional[str]
+    submitted_at: datetime.datetime
+
+class QueryBatch(BaseModel):
+    queries: List[OfflineQuery]
+
+# Advisory
+class AdvisoryResponse(BaseModel):
+    advisory_id: int
+    query_id: int
+    advisory_text: str
+    confidence_score: Optional[float]
+    generated_at: datetime.datetime
+
+    class Config:
+        orm_mode = True
+        
+# Saved Advisory
+class SavedAdvisoryCreate(BaseModel):
+    advisory_id: int
+
+class SavedAdvisoryResponse(BaseModel):
+    saved_advisory_id: int
+    farmer_id: int
+    advisory_id: int
+
+    class Config:
+        orm_mode = True
+
+# Feedback
+class FeedbackCreate(BaseModel):
+    advisory_id: int
+    is_helpful: bool
+
+class FeedbackResponse(BaseModel):
+    feedback_id: int
+    message: str = "Feedback submitted successfully."
+
+# Alert
+class AlertResponse(BaseModel):
+    alert_id: int
+    title: str
+    message: str
+    sent_at: datetime.datetime
+
+    class Config:
+        orm_mode = True
+
+# System User (Admin/Expert)
+class SystemUserCreate(BaseModel):
+    username: str
+    password: str
+    role: str
+
+class SystemUserLogin(BaseModel):
+    username: str
+    password: str
+
+# Knowledge Base
+class ArticleCreate(BaseModel):
+    title: str
+    content: str
+
+class ArticleUpdate(ArticleCreate):
+    pass
+
+class ArticleResponse(ArticleCreate):
+    article_id: int
+    status: str
+    author_id: int
+    validator_id: Optional[int]
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+
+    class Config:
+        orm_mode = True
+
+class ArticleSummary(BaseModel):
+    article_id: int
+    title: str
+    status: str
+    author_id: int
+    created_at: datetime.datetime
+
+    class Config:
+        orm_mode = True
+
+# Admin Specific
+class AdminAlertCreate(BaseModel):
+    title: str
+    message: str
+    target_criteria: Dict[str, Any]
+    schedule_at: Optional[datetime.datetime] = None
+
+class AdminAlertResponse(BaseModel):
+    alert_id: int
+    title: str
+    message: str
+    status: str = "Scheduled"
+
+# --- Authentication and Authorization (auth.py) ---
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[datetime.timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_current_farmer(token: str = Depends(oauth2_scheme_farmer), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        mobile_number: str = payload.get("sub")
+        if mobile_number is None:
+            raise credentials_exception
+        token_data = TokenData(sub=mobile_number)
+    except JWTError:
+        raise credentials_exception
+    farmer = db.query(Farmer).filter(Farmer.mobile_number == token_data.sub).first()
+    if farmer is None:
+        raise credentials_exception
+    return farmer
+
+def get_current_system_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        role: str = payload.get("role")
+        if username is None or role is None:
+            raise credentials_exception
+        token_data = TokenData(sub=username, role=role)
+    except JWTError:
+        raise credentials_exception
+    user = db.query(SystemUser).filter(SystemUser.username == token_data.sub).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+def get_current_admin(current_user: SystemUser = Depends(get_current_system_user)):
+    if current_user.role != "Admin":
+        raise HTTPException(status_code=403, detail="The user doesn't have enough privileges")
+    return current_user
+
+def get_current_expert(current_user: SystemUser = Depends(get_current_system_user)):
+    if current_user.role != "Expert":
+        raise HTTPException(status_code=403, detail="The user doesn't have enough privileges")
+    return current_user
+
+
+# --- Application Routers ---
+
+# Auth Router (Farmer)
+router_auth = APIRouter(prefix="/auth", tags=["Farmer Authentication"])
+
+@router_auth.post("/register")
+def register_farmer(mobile_number: str = Body(..., embed=True)):
+    # In a real app, this would send an OTP via an SMS gateway
+    # For now, we simulate it.
+    print(f"OTP for {mobile_number} is 123456") # Simulate sending OTP
+    return {"message": f"OTP sent to {mobile_number}"}
+
+@router_auth.post("/verify")
+def verify_farmer(mobile_number: str = Body(...), otp: str = Body(...), db: Session = Depends(get_db)):
+    # In a real app, verify the OTP. Here we accept a dummy one.
+    if otp != "123456":
+        raise HTTPException(status_code=400, detail="Invalid OTP")
+
+    farmer = db.query(Farmer).filter(Farmer.mobile_number == mobile_number).first()
+    is_profile_complete = False
+    if not farmer:
+        farmer = Farmer(mobile_number=mobile_number)
+        db.add(farmer)
+        db.commit()
+        db.refresh(farmer)
+    else:
+        if farmer.name and farmer.location and farmer.preferred_language:
+            is_profile_complete = True
+
+    access_token_expires = datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": farmer.mobile_number}, expires_delta=access_token_expires
+    )
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "farmer_id": farmer.farmer_id,
+        "is_profile_complete": is_profile_complete
+    }
+
+# Farmer Router
+router_farmers = APIRouter(prefix="/farmers", tags=["Farmer Profile"])
+
+@router_farmers.get("/me", response_model=FarmerProfile)
+def read_farmer_me(current_farmer: Farmer = Depends(get_current_farmer)):
+    return current_farmer
+
+@router_farmers.put("/me", response_model=FarmerProfile)
+def update_farmer_me(profile_update: FarmerProfileUpdate, db: Session = Depends(get_db), current_farmer: Farmer = Depends(get_current_farmer)):
+    current_farmer.name = profile_update.name
+    current_farmer.location = profile_update.location
+    current_farmer.preferred_language = profile_update.preferred_language
+    db.commit()
+    db.refresh(current_farmer)
+    return current_farmer
+
+@router_farmers.get("/me/crops", response_model=List[Crop])
+def get_farmer_crops(db: Session = Depends(get_db), current_farmer: Farmer = Depends(get_current_farmer)):
+    farmer_crops = db.query(FarmerCrop).filter(FarmerCrop.farmer_id == current_farmer.farmer_id).all()
+    crop_ids = [fc.crop_id for fc in farmer_crops]
+    if not crop_ids:
+        return []
+    return db.query(Crop).filter(Crop.crop_id.in_(crop_ids)).all()
+
+@router_farmers.post("/me/crops", response_model=FarmerCropResponse)
+def add_farmer_crop(crop_id: int = Body(..., embed=True), db: Session = Depends(get_db), current_farmer: Farmer = Depends(get_current_farmer)):
+    db_crop = db.query(Crop).filter(Crop.crop_id == crop_id).first()
+    if not db_crop:
+        raise HTTPException(status_code=404, detail="Crop not found")
+    
+    existing_link = db.query(FarmerCrop).filter(FarmerCrop.farmer_id == current_farmer.farmer_id, FarmerCrop.crop_id == crop_id).first()
+    if existing_link:
+        raise HTTPException(status_code=400, detail="Farmer already has this crop")
+
+    db_farmer_crop = FarmerCrop(farmer_id=current_farmer.farmer_id, crop_id=crop_id)
+    db.add(db_farmer_crop)
+    db.commit()
+    db.refresh(db_farmer_crop)
+    return db_farmer_crop
+
+# Queries Router
+router_queries = APIRouter(prefix="/queries", tags=["Farmer Queries"])
+
+@router_queries.post("", response_model=QueryResponse)
+def submit_query(
+    query_type: str = Form(...),
+    query_text: Optional[str] = Form(None),
+    query_file: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db), 
+    current_farmer: Farmer = Depends(get_current_farmer)
+):
+    image_url = None
+    if query_type in ['image', 'voice'] and query_file:
+        # In a real app, save the file to a cloud storage (e.g., S3) and get the URL
+        file_path = f"uploads/{query_file.filename}"
+        with open(file_path, "wb") as buffer:
+            buffer.write(query_file.file.read())
+        image_url = file_path # Placeholder URL
+    
+    db_query = Query(
+        farmer_id=current_farmer.farmer_id,
+        query_type=query_type,
+        query_text=query_text,
+        query_image_url=image_url,
+        status='submitted'
+    )
+    db.add(db_query)
+    db.commit()
+    db.refresh(db_query)
+    # Simulate generating an advisory for demo purposes
+    advisory_text = f"This is an AI-generated advisory for your '{query_type}' query. Please consult an expert for critical decisions."
+    db_advisory = Advisory(query_id=db_query.query_id, advisory_text=advisory_text, confidence_score=95.5)
+    db.add(db_advisory)
+    db_query.status = 'answered'
+    db.commit()
+    return db_query
+
+@router_queries.post("/batch")
+def submit_batch_queries(batch: QueryBatch, db: Session = Depends(get_db), current_farmer: Farmer = Depends(get_current_farmer)):
+    for q in batch.queries:
+        db_query = Query(
+            farmer_id=current_farmer.farmer_id,
+            query_type=q.query_type,
+            query_text=q.query_text,
+            submitted_at=q.submitted_at,
+            is_offline_submission=True,
+            status='submitted'
+        )
+        db.add(db_query)
+    db.commit()
+    return {"message": f"{len(batch.queries)} offline queries submitted successfully.", "batch_id": "some-batch-id"}
+
+@router_queries.get("", response_model=List[QuerySummary])
+def get_query_history(
+    page: int = 1, limit: int = 10,
+    db: Session = Depends(get_db), 
+    current_farmer: Farmer = Depends(get_current_farmer)
+):
+    offset = (page - 1) * limit
+    queries = db.query(Query).filter(Query.farmer_id == current_farmer.farmer_id).order_by(Query.submitted_at.desc()).offset(offset).limit(limit).all()
+    return queries
+
+@router_queries.get("/{query_id}/advisory", response_model=AdvisoryResponse)
+def get_query_advisory(query_id: int, db: Session = Depends(get_db), current_farmer: Farmer = Depends(get_current_farmer)):
+    db_query = db.query(Query).filter(Query.query_id == query_id, Query.farmer_id == current_farmer.farmer_id).first()
+    if not db_query:
+        raise HTTPException(status_code=404, detail="Query not found")
+    if not db_query.advisory:
+        raise HTTPException(status_code=404, detail="Advisory not yet generated for this query")
+    return db_query.advisory
+
+# Advisory and Feedback Router
+router_advisories = APIRouter(tags=["Advisories & Feedback"])
+
+@router_advisories.get("/saved-advisories", response_model=List[AdvisoryResponse])
+def get_saved_advisories(db: Session = Depends(get_db), current_farmer: Farmer = Depends(get_current_farmer)):
+    saved = db.query(SavedAdvisory).filter(SavedAdvisory.farmer_id == current_farmer.farmer_id).all()
+    advisory_ids = [s.advisory_id for s in saved]
+    if not advisory_ids:
+        return []
+    return db.query(Advisory).filter(Advisory.advisory_id.in_(advisory_ids)).all()
+
+@router_advisories.post("/saved-advisories", response_model=SavedAdvisoryResponse)
+def save_advisory(data: SavedAdvisoryCreate, db: Session = Depends(get_db), current_farmer: Farmer = Depends(get_current_farmer)):
+    db_advisory = db.query(Advisory).filter(Advisory.advisory_id == data.advisory_id).first()
+    if not db_advisory:
+        raise HTTPException(status_code=404, detail="Advisory not found")
+    
+    existing = db.query(SavedAdvisory).filter(SavedAdvisory.farmer_id == current_farmer.farmer_id, SavedAdvisory.advisory_id == data.advisory_id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Advisory already saved")
+
+    db_saved = SavedAdvisory(farmer_id=current_farmer.farmer_id, advisory_id=data.advisory_id)
+    db.add(db_saved)
+    db.commit()
+    db.refresh(db_saved)
+    return db_saved
+
+@router_advisories.delete("/saved-advisories/{saved_advisory_id}")
+def remove_saved_advisory(saved_advisory_id: int, db: Session = Depends(get_db), current_farmer: Farmer = Depends(get_current_farmer)):
+    db_saved = db.query(SavedAdvisory).filter(SavedAdvisory.saved_advisory_id == saved_advisory_id, SavedAdvisory.farmer_id == current_farmer.farmer_id).first()
+    if not db_saved:
+        raise HTTPException(status_code=404, detail="Saved advisory not found")
+    db.delete(db_saved)
+    db.commit()
+    return {"message": "Advisory removed from saved list"}
+
+@router_advisories.post("/feedback", response_model=FeedbackResponse)
+def submit_feedback(data: FeedbackCreate, db: Session = Depends(get_db), current_farmer: Farmer = Depends(get_current_farmer)):
+    db_advisory = db.query(Advisory).filter(Advisory.advisory_id == data.advisory_id).first()
+    if not db_advisory:
+        raise HTTPException(status_code=404, detail="Advisory not found")
+    
+    db_feedback = Feedback(advisory_id=data.advisory_id, farmer_id=current_farmer.farmer_id, is_helpful=data.is_helpful)
+    db.add(db_feedback)
+    db.commit()
+    db.refresh(db_feedback)
+    return FeedbackResponse(feedback_id=db_feedback.feedback_id)
+
+# General Info Router
+router_general = APIRouter(tags=["General Information"])
+
+@router_general.get("/alerts", response_model=List[AlertResponse])
+def get_alerts(db: Session = Depends(get_db), current_farmer: Farmer = Depends(get_current_farmer)):
+    # In a real app, this would be targeted based on farmer's location/crops
+    return db.query(Alert).order_by(Alert.sent_at.desc()).limit(20).all()
+
+@router_general.get("/crops", response_model=List[Crop])
+def get_master_crop_list(db: Session = Depends(get_db)):
+    return db.query(Crop).order_by(Crop.crop_name).all()
+
+# Admin Router
+router_admin = APIRouter(prefix="/admin", tags=["Admin & Expert"])
+
+@router_admin.post("/auth/login", response_model=Token)
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(SystemUser).filter(SystemUser.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username, "role": user.role}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@router_admin.get("/articles", response_model=List[ArticleSummary])
+def get_articles(
+    status: Optional[str] = FQuery(None),
+    author_id: Optional[int] = FQuery(None),
+    page: int = 1, limit: int = 10,
+    db: Session = Depends(get_db),
+    current_user: SystemUser = Depends(get_current_system_user) # Admin or Expert
+):
+    query = db.query(KnowledgeBaseArticle)
+    if status:
+        query = query.filter(KnowledgeBaseArticle.status == status)
+    if author_id:
+        query = query.filter(KnowledgeBaseArticle.author_id == author_id)
+    
+    offset = (page - 1) * limit
+    return query.order_by(KnowledgeBaseArticle.updated_at.desc()).offset(offset).limit(limit).all()
+
+@router_admin.post("/articles", response_model=ArticleResponse, status_code=201)
+def create_article(article: ArticleCreate, db: Session = Depends(get_db), current_admin: SystemUser = Depends(get_current_admin)):
+    db_article = KnowledgeBaseArticle(**article.dict(), author_id=current_admin.user_id, status='draft')
+    db.add(db_article)
+    db.commit()
+    db.refresh(db_article)
+    return db_article
+
+@router_admin.get("/articles/{article_id}", response_model=ArticleResponse)
+def get_article_details(article_id: int, db: Session = Depends(get_db), current_user: SystemUser = Depends(get_current_system_user)):
+    article = db.query(KnowledgeBaseArticle).filter(KnowledgeBaseArticle.article_id == article_id).first()
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    return article
+
+@router_admin.put("/articles/{article_id}", response_model=ArticleResponse)
+def update_article(article_id: int, article_update: ArticleUpdate, db: Session = Depends(get_db), current_admin: SystemUser = Depends(get_current_admin)):
+    db_article = db.query(KnowledgeBaseArticle).filter(KnowledgeBaseArticle.article_id == article_id).first()
+    if not db_article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    if db_article.author_id != current_admin.user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to update this article")
+    
+    db_article.title = article_update.title
+    db_article.content = article_update.content
+    db_article.status = 'draft' # Editing reverts status to draft
+    db.commit()
+    db.refresh(db_article)
+    return db_article
+
+@router_admin.post("/articles/{article_id}/submit")
+def submit_article_for_review(article_id: int, db: Session = Depends(get_db), current_admin: SystemUser = Depends(get_current_admin)):
+    db_article = db.query(KnowledgeBaseArticle).filter(KnowledgeBaseArticle.article_id == article_id).first()
+    if not db_article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    if db_article.status != 'draft':
+        raise HTTPException(status_code=400, detail=f"Article must be in 'draft' status to submit. Current status: {db_article.status}")
+    db_article.status = 'pending_review'
+    db.commit()
+    return {"message": "Article submitted for review", "new_status": "pending_review"}
+
+@router_admin.post("/articles/{article_id}/approve")
+def approve_article(article_id: int, db: Session = Depends(get_db), current_expert: SystemUser = Depends(get_current_expert)):
+    db_article = db.query(KnowledgeBaseArticle).filter(KnowledgeBaseArticle.article_id == article_id).first()
+    if not db_article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    if db_article.status != 'pending_review':
+        raise HTTPException(status_code=400, detail=f"Article must be in 'pending_review' status to approve. Current status: {db_article.status}")
+    db_article.status = 'published'
+    db_article.validator_id = current_expert.user_id
+    db.commit()
+    return {"message": "Article approved and published", "new_status": "published"}
+
+@router_admin.post("/articles/{article_id}/reject")
+def reject_article(article_id: int, comment: str = Body(..., embed=True), db: Session = Depends(get_db), current_expert: SystemUser = Depends(get_current_expert)):
+    db_article = db.query(KnowledgeBaseArticle).filter(KnowledgeBaseArticle.article_id == article_id).first()
+    if not db_article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    # In a real app, you would store this comment.
+    print(f"Rejection comment for article {article_id} by expert {current_expert.username}: {comment}")
+    db_article.status = 'draft'
+    db_article.validator_id = current_expert.user_id
+    db.commit()
+    return {"message": "Article rejected and returned to draft", "new_status": "draft"}
+
+@router_admin.get("/queries")
+def get_all_queries(db: Session = Depends(get_db), current_admin: SystemUser = Depends(get_current_admin)):
+    # Simplified for demonstration. Real implementation would handle query params.
+    return db.query(Query).order_by(Query.submitted_at.desc()).all()
+
+@router_admin.post("/alerts", response_model=AdminAlertResponse)
+def create_alert(alert_data: AdminAlertCreate, db: Session = Depends(get_db), current_admin: SystemUser = Depends(get_current_admin)):
+    # In a real app, this would use a background task runner like Celery
+    # to handle targeting and scheduling.
+    db_alert = Alert(
+        title=alert_data.title,
+        message=alert_data.message,
+        creator_id=current_admin.user_id
+    )
+    if alert_data.schedule_at:
+        db_alert.sent_at = alert_data.schedule_at
+    db.add(db_alert)
+    db.commit()
+    db.refresh(db_alert)
+    return AdminAlertResponse(alert_id=db_alert.alert_id, title=db_alert.title, message=db_alert.message)
+
+@router_admin.get("/alerts", response_model=List[AlertResponse])
+def get_alert_history(db: Session = Depends(get_db), current_admin: SystemUser = Depends(get_current_admin)):
+    return db.query(Alert).order_by(Alert.sent_at.desc()).all()
+
+# --- Main FastAPI App ---
+
+app = FastAPI(
+    title="Agri-Advisory API",
+    description="API for a digital advisory platform for farmers.",
+    version="1.0.0"
+)
+
+# Include all the routers
+app.include_router(router_auth)
+app.include_router(router_farmers)
+app.include_router(router_queries)
+app.include_router(router_advisories)
+app.include_router(router_general)
+app.include_router(router_admin)
+
+# On startup event to create DB tables and initial data
+@app.on_event("startup")
+def on_startup():
+    Base.metadata.create_all(bind=engine)
+    # Add initial data if needed
+    db = SessionLocal()
+    # Create Admin and Expert if they don't exist
+    if not db.query(SystemUser).filter(SystemUser.username == 'admin').first():
+        admin_user = SystemUser(username='admin', password_hash=get_password_hash('adminpass'), role='Admin')
+        db.add(admin_user)
+    if not db.query(SystemUser).filter(SystemUser.username == 'expert').first():
+        expert_user = SystemUser(username='expert', password_hash=get_password_hash('expertpass'), role='Expert')
+        db.add(expert_user)
+    
+    # Add some master crops if they don't exist
+    if db.query(Crop).count() == 0:
+        crops_to_add = [Crop(crop_name='Wheat'), Crop(crop_name='Rice'), Crop(crop_name='Corn'), Crop(crop_name='Sugarcane')]
+        db.add_all(crops_to_add)
+
+    db.commit()
+    db.close()
+
+    # Create upload directory
+    if not os.path.exists('uploads'):
+        os.makedirs('uploads')
+
+@app.get("/", tags=["Root"])
+def read_root():
+    return {"message": "Welcome to the Agri-Advisory API"}
